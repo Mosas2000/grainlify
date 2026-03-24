@@ -903,7 +903,6 @@ fn test_sequential_batch_overlap_fails() {
 
 #[test]
 fn test_register_program_juris_config() {
-fn test_register_prog_w_juris_config() {
     setup!(
         env,
         client,
@@ -923,7 +922,6 @@ fn test_register_prog_w_juris_config() {
     };
 
     client.register_program_juris(
-    client.register_prog_w_juris(
         &91,
         &program_admin,
         &String::from_str(&env, "EU Hackathon Program"),
@@ -937,17 +935,12 @@ fn test_register_prog_w_juris_config() {
     );
 
     let program = client.get_program(&91);
+    assert_eq!(program.jurisdiction, OptionalJurisdiction::Some(cfg.clone()));
     assert_eq!(client.get_program_jurisdiction(&91), Some(cfg));
 }
 
 #[test]
 fn test_register_program_juris_requires_kyc_attestation() {
-    assert_eq!(program.jurisdiction, OptionalJurisdiction::Some(cfg.clone()));
-    assert_eq!(client.get_program_jurisdiction(&91), OptionalJurisdiction::Some(cfg));
-}
-
-#[test]
-fn test_register_prog_w_juris_requires_kyc_attestation() {
     setup!(
         env,
         client,
@@ -967,7 +960,6 @@ fn test_register_prog_w_juris_requires_kyc_attestation() {
     };
 
     let res = client.try_register_program_juris(
-    let res = client.try_register_prog_w_juris(
         &92,
         &program_admin,
         &String::from_str(&env, "US Program"),
@@ -976,7 +968,7 @@ fn test_register_prog_w_juris_requires_kyc_attestation() {
         &cfg.requires_kyc,
         &cfg.max_funding.clone(),
         &cfg.registration_paused,
-        &OptionalJurisdiction::Some(cfg),
+        &OptionalJurisdiction::Some(cfg.clone()),
         &Some(false),
     );
     assert!(res.is_err());
@@ -984,7 +976,6 @@ fn test_register_prog_w_juris_requires_kyc_attestation() {
 
 #[test]
 fn test_register_program_juris_max_funding_enforced() {
-fn test_register_prog_w_juris_max_funding_enforced() {
     setup!(
         env,
         client,
@@ -1004,7 +995,6 @@ fn test_register_prog_w_juris_max_funding_enforced() {
     };
 
     let res = client.try_register_program_juris(
-    let res = client.try_register_prog_w_juris(
         &93,
         &program_admin,
         &String::from_str(&env, "Capped Program"),
@@ -1013,7 +1003,7 @@ fn test_register_prog_w_juris_max_funding_enforced() {
         &cfg.requires_kyc,
         &cfg.max_funding.clone(),
         &cfg.registration_paused,
-        &OptionalJurisdiction::Some(cfg),
+        &OptionalJurisdiction::Some(cfg.clone()),
         &None,
     );
     assert!(res.is_err());
@@ -1021,7 +1011,6 @@ fn test_register_prog_w_juris_max_funding_enforced() {
 
 #[test]
 fn test_register_program_juris_pause_enforced() {
-fn test_register_prog_w_juris_pause_enforced() {
     setup!(
         env,
         client,
@@ -1041,7 +1030,6 @@ fn test_register_prog_w_juris_pause_enforced() {
     };
 
     let res = client.try_register_program_juris(
-    let res = client.try_register_prog_w_juris(
         &94,
         &program_admin,
         &String::from_str(&env, "Paused Program"),
@@ -1050,7 +1038,7 @@ fn test_register_prog_w_juris_pause_enforced() {
         &cfg.requires_kyc,
         &cfg.max_funding.clone(),
         &cfg.registration_paused,
-        &OptionalJurisdiction::Some(cfg),
+        &OptionalJurisdiction::Some(cfg.clone()),
         &None,
     );
     assert!(res.is_err());
@@ -1058,7 +1046,6 @@ fn test_register_prog_w_juris_pause_enforced() {
 
 #[test]
 fn test_batch_register_juris() {
-fn test_batch_reg_progs_w_juris() {
     setup!(
         env,
         client,
@@ -1109,16 +1096,10 @@ fn test_batch_reg_progs_w_juris() {
     assert_eq!(count, 2);
 
     let generic = client.get_program(&95);
+    assert_eq!(generic.jurisdiction, OptionalJurisdiction::None);
     assert_eq!(client.get_program_jurisdiction(&95), None);
 
     let eu = client.get_program(&96);
+    assert_eq!(eu.jurisdiction, OptionalJurisdiction::Some(eu_cfg.clone()));
     assert_eq!(client.get_program_jurisdiction(&96), Some(eu_cfg));
-    let count = client.batch_reg_progs_w_juris(&items);
-    assert_eq!(count, 2);
-
-    let generic = client.get_program(&95);
-    assert_eq!(generic.jurisdiction, OptionalJurisdiction::None);
-
-    let eu = client.get_program(&96);
-    assert_eq!(eu.jurisdiction, OptionalJurisdiction::Some(eu_cfg));
 }
