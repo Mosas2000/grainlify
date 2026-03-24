@@ -13,7 +13,8 @@ on:
   workflow_dispatch:
 
 env:
-  RUST_VERSION: 1.74.0
+  # Use stable to ensure compatibility with Cargo.lock v4 across contract crates.
+  RUST_VERSION: stable
   SOROBAN_CLI_VERSION: 20.0.0
 
 jobs:
