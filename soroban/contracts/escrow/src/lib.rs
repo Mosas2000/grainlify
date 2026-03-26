@@ -3,55 +3,34 @@
 //! Parity with main contracts/bounty_escrow where applicable; see soroban/PARITY.md.
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, token, Address, BytesN, Env, String, Vec,
+    contract, contracterror, contractimpl, contracttype, token, Address, BytesN, Env,
 };
-
-const ESCROW_DELEGATE_SET: soroban_sdk::Symbol = symbol_short!("EscDlgS");
-const ESCROW_DELEGATE_REVOKED: soroban_sdk::Symbol = symbol_short!("EscDlgR");
-const ESCROW_METADATA_UPDATED: soroban_sdk::Symbol = symbol_short!("EscMeta");
-const LABEL_CONFIG_UPDATED: soroban_sdk::Symbol = symbol_short!("LblCfg");
-const ESCROW_LABELS_UPDATED: soroban_sdk::Symbol = symbol_short!("EscLbls");
-
-const MAX_LABEL_LENGTH: u32 = 32;
-const MAX_LABELS: u32 = 10;
-const MAX_PAGE_SIZE: u32 = 50;
-
-pub const DELEGATE_PERMISSION_RELEASE: u32 = 1 << 0;
-pub const DELEGATE_PERMISSION_REFUND: u32 = 1 << 1;
-pub const DELEGATE_PERMISSION_UPDATE_META: u32 = 1 << 2;
-pub const DELEGATE_PERMISSION_MASK: u32 = DELEGATE_PERMISSION_RELEASE
-    | DELEGATE_PERMISSION_REFUND
-    | DELEGATE_PERMISSION_UPDATE_META;
 
 mod identity;
 pub use identity::*;
 
 mod reentrancy_guard;
 
-use grainlify_core::errors;
 #[contracterror]
 #[derive(Clone, Debug, PartialEq)]
 #[repr(u32)]
 pub enum Error {
-    NotInitialized = 2,
-    AlreadyInitialized = 1,
-    BountyExists = 201,
-    BountyNotFound = 202,
-    FundsNotLocked = 203,
+    NotInitialized = 1,
+    AlreadyInitialized = 2,
+    BountyExists = 3,
+    BountyNotFound = 4,
+    FundsNotLocked = 5,
     DeadlineNotPassed = 6,
-    Unauthorized = 3,
-    InsufficientFunds = 5,
-    InvalidLabel = 226,
-    TooManyLabels = 227,
-    LabelNotAllowed = 228,
+    Unauthorized = 7,
+    InsufficientBalance = 8,
     // Identity-related errors
-    InvalidSignature = 301,
-    ClaimExpired = 302,
-    UnauthorizedIssuer = 303,
-    InvalidClaimFormat = 304,
-    TransactionExceedsLimit = 305,
-    InvalidRiskScore = 306,
-    InvalidTier = 307,
+    InvalidSignature = 100,
+    ClaimExpired = 101,
+    UnauthorizedIssuer = 102,
+    InvalidClaimFormat = 103,
+    TransactionExceedsLimit = 104,
+    InvalidRiskScore = 105,
+    InvalidTier = 106,
 }
 
 #[contracttype]
@@ -70,53 +49,6 @@ pub struct Escrow {
     pub remaining_amount: i128,
     pub status: EscrowStatus,
     pub deadline: u64,
-    pub jurisdiction: OptionalJurisdiction,
-    pub labels: Vec<String>,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct EscrowJurisdictionConfig {
-    pub tag: Option<String>,
-    pub requires_kyc: bool,
-    pub enforce_identity_limits: bool,
-    pub lock_paused: bool,
-    pub release_paused: bool,
-    pub refund_paused: bool,
-    pub max_lock_amount: Option<i128>,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct EscrowDelegateSetEvent {
-    pub bounty_id: u64,
-    pub delegate: Address,
-    pub permissions: u32,
-    pub updated_by: Address,
-    pub timestamp: u64,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum OptionalJurisdiction {
-    None,
-    Some(EscrowJurisdictionConfig),
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct EscrowDelegateRevokedEvent {
-    pub bounty_id: u64,
-    pub revoked_by: Address,
-    pub timestamp: u64,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct EscrowMetadataUpdatedEvent {
-    pub bounty_id: u64,
-    pub updated_by: Address,
-    pub timestamp: u64,
 }
 
 #[contracttype]
@@ -124,15 +56,12 @@ pub enum DataKey {
     Admin,
     Token,
     Escrow(u64),
-    EscrowIndex,
-    LabelConfig,
     // Identity-related storage keys
     AddressIdentity(Address),
     AuthorizedIssuer(Address),
     TierLimits,
     RiskThresholds,
     ReentrancyGuard,
-    EscrowJurisdiction(u64),
 }
 
 #[contract]
@@ -140,102 +69,6 @@ pub struct EscrowContract;
 
 #[contractimpl]
 impl EscrowContract {
-    fn default_label_config(env: &Env) -> LabelConfig {
-        LabelConfig {
-            restricted: false,
-            allowed_labels: Vec::new(env),
-        }
-    }
-
-    fn get_label_config_internal(env: &Env) -> LabelConfig {
-        env.storage()
-            .persistent()
-            .get(&DataKey::LabelConfig)
-            .unwrap_or_else(|| Self::default_label_config(env))
-    }
-
-    fn validate_single_label(label: &String) -> Result<(), Error> {
-        if label.len() == 0 || label.len() > MAX_LABEL_LENGTH {
-            return Err(Error::InvalidLabel);
-        }
-        Ok(())
-    }
-
-    fn normalize_labels(env: &Env, labels: Vec<String>) -> Result<Vec<String>, Error> {
-        if labels.len() > MAX_LABELS {
-            return Err(Error::TooManyLabels);
-        }
-
-        let config = Self::get_label_config_internal(env);
-        let mut normalized = Vec::new(env);
-
-        for label in labels.iter() {
-            Self::validate_single_label(&label)?;
-
-            let mut exists = false;
-            for existing in normalized.iter() {
-                if existing == label {
-                    exists = true;
-                    break;
-                }
-            }
-            if exists {
-                continue;
-            }
-
-            if config.restricted {
-                let mut allowed = false;
-                for candidate in config.allowed_labels.iter() {
-                    if candidate == label {
-                        allowed = true;
-                        break;
-                    }
-                }
-                if !allowed {
-                    return Err(Error::LabelNotAllowed);
-                }
-            }
-
-            normalized.push_back(label);
-        }
-
-        Ok(normalized)
-    }
-
-    fn sanitize_label_config(env: &Env, labels: Vec<String>) -> Result<Vec<String>, Error> {
-        if labels.len() > MAX_LABELS {
-            return Err(Error::TooManyLabels);
-        }
-
-        let mut normalized = Vec::new(env);
-        for label in labels.iter() {
-            Self::validate_single_label(&label)?;
-
-            let mut exists = false;
-            for existing in normalized.iter() {
-                if existing == label {
-                    exists = true;
-                    break;
-                }
-            }
-            if !exists {
-                normalized.push_back(label);
-            }
-        }
-
-        Ok(normalized)
-    }
-
-    fn append_escrow_id(env: &Env, bounty_id: u64) {
-        let mut index: Vec<u64> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::EscrowIndex)
-            .unwrap_or_else(|| Vec::new(env));
-        index.push_back(bounty_id);
-        env.storage().persistent().set(&DataKey::EscrowIndex, &index);
-    }
-
     /// Initialize with admin and token. Call once.
     pub fn init(env: Env, admin: Address, token: Address) -> Result<(), Error> {
         if env.storage().instance().has(&DataKey::Admin) {
@@ -257,8 +90,17 @@ impl EscrowContract {
         Ok(())
     }
 
-    /// Set or update an authorized claim issuer (admin only)
-    pub fn set_authorized_issuer(env: Env, issuer: Address, authorized: bool) -> Result<(), Error> {
+    /// Set or update an authorized claim issuer (admin only).
+    ///
+    /// The issuer's Ed25519 public key is bound to the issuer Address at
+    /// authorization time.  This prevents an attacker from submitting a claim
+    /// that references an authorized issuer but is signed with a different key.
+    pub fn set_authorized_issuer(
+        env: Env,
+        issuer: Address,
+        issuer_pubkey: BytesN<32>,
+        authorized: bool,
+    ) -> Result<(), Error> {
         let admin: Address = env
             .storage()
             .instance()
@@ -266,9 +108,15 @@ impl EscrowContract {
             .ok_or(Error::NotInitialized)?;
         admin.require_auth();
 
-        env.storage()
-            .persistent()
-            .set(&DataKey::AuthorizedIssuer(issuer.clone()), &authorized);
+        if authorized {
+            env.storage()
+                .persistent()
+                .set(&DataKey::AuthorizedIssuer(issuer.clone()), &issuer_pubkey);
+        } else {
+            env.storage()
+                .persistent()
+                .remove(&DataKey::AuthorizedIssuer(issuer.clone()));
+        }
 
         // Emit event for issuer management
         env.events().publish(
@@ -335,12 +183,17 @@ impl EscrowContract {
         Ok(())
     }
 
-    /// Submit an identity claim for verification and storage
+    /// Submit an identity claim for verification and storage.
+    ///
+    /// The issuer's Ed25519 public key is looked up from the on-chain
+    /// authorization store (set by the admin via `set_authorized_issuer`).
+    /// The caller no longer provides the key, which closes the spoofing
+    /// vector where a claim could reference an authorized issuer but be
+    /// signed with an attacker-controlled key.
     pub fn submit_identity_claim(
         env: Env,
         claim: IdentityClaim,
         signature: BytesN<64>,
-        issuer_pubkey: BytesN<32>,
     ) -> Result<(), Error> {
         // Require authentication from the address in the claim
         claim.address.require_auth();
@@ -362,23 +215,19 @@ impl EscrowContract {
             return Err(Error::ClaimExpired);
         }
 
-        // Check if issuer is authorized
-        let is_authorized: bool = env
+        // Look up the issuer's bound public key from storage.
+        // This ensures the claim was signed by the key the admin authorized.
+        let issuer_pubkey: BytesN<32> = env
             .storage()
             .persistent()
             .get(&DataKey::AuthorizedIssuer(claim.issuer.clone()))
-            .unwrap_or(false);
+            .ok_or(Error::UnauthorizedIssuer)?;
 
-        if !is_authorized {
-            env.events().publish(
-                (soroban_sdk::symbol_short!("claim"), claim.address.clone()),
-                soroban_sdk::symbol_short!("unauth"),
-            );
-            return Err(Error::UnauthorizedIssuer);
-        }
-
-        // Verify claim signature
-        identity::verify_claim_signature(&env, &claim, &signature, &issuer_pubkey)?;
+        // Verify claim signature using the stored pubkey.
+        // ed25519_verify panics on invalid signatures; the Soroban host
+        // converts the panic into a failed transaction, so callers observe
+        // an error either way.
+        identity::verify_claim_signature(&env, &claim, &signature, &issuer_pubkey);
 
         // Store identity data for the address
         let now = env.ledger().timestamp();
@@ -482,57 +331,6 @@ impl EscrowContract {
         Ok(())
     }
 
-    fn validate_delegate_permissions(permissions: u32) -> Result<(), Error> {
-        if permissions == 0 || permissions & !DELEGATE_PERMISSION_MASK != 0 {
-            return Err(Error::InvalidDelegatePermissions);
-        }
-        Ok(())
-    }
-
-    fn is_admin(env: &Env, caller: &Address) -> Result<bool, Error> {
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(Error::NotInitialized)?;
-        Ok(admin == *caller)
-    }
-
-    fn require_escrow_owner_or_admin(
-        env: &Env,
-        escrow: &Escrow,
-        caller: &Address,
-    ) -> Result<(), Error> {
-        caller.require_auth();
-        if *caller == escrow.depositor || Self::is_admin(env, caller)? {
-            return Ok(());
-        }
-        Err(Error::Unauthorized)
-    }
-
-    fn require_escrow_actor(
-        env: &Env,
-        escrow: &Escrow,
-        caller: &Address,
-        required_permission: u32,
-    ) -> Result<(), Error> {
-        caller.require_auth();
-        if *caller == escrow.depositor || Self::is_admin(env, caller)? {
-            return Ok(());
-        }
-
-        let delegate_matches = escrow
-            .delegate
-            .as_ref()
-            .map(|delegate| delegate == caller)
-            .unwrap_or(false);
-        if delegate_matches && (escrow.delegate_permissions & required_permission) == required_permission {
-            return Ok(());
-        }
-
-        Err(Error::Unauthorized)
-    }
-
     /// Lock funds: depositor must be authorized; tokens transferred from depositor to contract.
     ///
     /// # Reentrancy
@@ -545,107 +343,34 @@ impl EscrowContract {
         amount: i128,
         deadline: u64,
     ) -> Result<(), Error> {
-        Self::lock_funds_with_jurisdiction(
-            env,
-            depositor,
-            bounty_id,
-            amount,
-            deadline,
-            OptionalJurisdiction::None,
-        )
-    }
-
-    /// Lock funds with optional jurisdiction controls.
-    pub fn lock_funds_with_jurisdiction(
-        env: Env,
-        depositor: Address,
-        bounty_id: u64,
-        amount: i128,
-        deadline: u64,
-        jurisdiction: OptionalJurisdiction,
-    ) -> Result<(), Error> {
         // GUARD: acquire reentrancy lock
         reentrancy_guard::acquire(&env);
 
         depositor.require_auth();
         if !env.storage().instance().has(&DataKey::Admin) {
-            reentrancy_guard::release(&env);
             return Err(Error::NotInitialized);
         }
         if amount <= 0 {
-            return Err(Error::InsufficientFunds);
+            return Err(Error::InsufficientBalance);
         }
         if env.storage().persistent().has(&DataKey::Escrow(bounty_id)) {
-            reentrancy_guard::release(&env);
             return Err(Error::BountyExists);
         }
 
-        // Enforcement rules from JURISDICTION_SEGMENTATION.md
-        if let OptionalJurisdiction::Some(config) = &jurisdiction {
-            if config.lock_paused {
-                reentrancy_guard::release(&env);
-                return Err(Error::Unauthorized);
-            }
-            if let Some(max_amount) = config.max_lock_amount {
-                if amount > max_amount {
-                    reentrancy_guard::release(&env);
-                    return Err(Error::TransactionExceedsLimit);
-                }
-            }
-            if config.requires_kyc && !Self::is_claim_valid(env.clone(), depositor.clone()) {
-                reentrancy_guard::release(&env);
-                return Err(Error::Unauthorized);
-            }
-            if config.enforce_identity_limits {
-                if let Err(e) = Self::enforce_transaction_limit(&env, &depositor, amount) {
-                    reentrancy_guard::release(&env);
-                    return Err(e);
-                }
-            }
-        } else {
-            // Generic behavior: always enforce identity limits
-            if let Err(e) = Self::enforce_transaction_limit(&env, &depositor, amount) {
-                reentrancy_guard::release(&env);
-                return Err(e);
-            }
-        }
+        // Enforce transaction limit based on identity tier
+        Self::enforce_transaction_limit(&env, &depositor, amount)?;
 
         // EFFECTS: write escrow state before external call
-        let labels = Vec::new(&env);
         let escrow = Escrow {
             depositor: depositor.clone(),
             amount,
             remaining_amount: amount,
             status: EscrowStatus::Locked,
             deadline,
-            jurisdiction: jurisdiction.clone(),
-            labels: Vec::new(&env),
         };
         env.storage()
             .persistent()
             .set(&DataKey::Escrow(bounty_id), &escrow);
-        Self::append_escrow_id(&env, bounty_id);
-
-        // Store jurisdiction config separately if present
-        if let OptionalJurisdiction::Some(config) = &jurisdiction {
-            env.storage()
-                .persistent()
-                .set(&DataKey::EscrowJurisdiction(bounty_id), config);
-
-            // Emit juris event for lock
-            env.events().publish(
-                (
-                    soroban_sdk::symbol_short!("juris"),
-                    soroban_sdk::symbol_short!("lock"),
-                    bounty_id,
-                ),
-                (
-                    config.tag.clone(),
-                    config.requires_kyc,
-                    config.enforce_identity_limits,
-                ),
-            );
-        }
 
         // INTERACTION: external token transfer is last
         let token = env
@@ -662,38 +387,17 @@ impl EscrowContract {
         Ok(())
     }
 
-    /// Read escrow jurisdiction config.
-    pub fn get_escrow_jurisdiction(env: Env, bounty_id: u64) -> OptionalJurisdiction {
-        let escrow: Option<Escrow> = env.storage().persistent().get(&DataKey::Escrow(bounty_id));
-        match escrow {
-            Some(e) => e.jurisdiction,
-            None => OptionalJurisdiction::None,
-        }
-    }
-
     /// Release funds to contributor. Admin must be authorized. Fails if already released or refunded.
     ///
     /// # Reentrancy
     /// Protected by reentrancy guard. Escrow state is updated to
     /// `Released` *before* the outbound token transfer (CEI pattern).
     pub fn release_funds(env: Env, bounty_id: u64, contributor: Address) -> Result<(), Error> {
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(Error::NotInitialized)?;
-        Self::release_funds_by(env, admin, bounty_id, contributor)
-    }
-
-    pub fn release_funds_by(
-        env: Env,
-        caller: Address,
-        bounty_id: u64,
-        contributor: Address,
-    ) -> Result<(), Error> {
         // GUARD: acquire reentrancy lock
         reentrancy_guard::acquire(&env);
 
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
         if !env.storage().persistent().has(&DataKey::Escrow(bounty_id)) {
             return Err(Error::BountyNotFound);
         }
@@ -703,12 +407,11 @@ impl EscrowContract {
             .persistent()
             .get(&DataKey::Escrow(bounty_id))
             .unwrap();
-        Self::require_escrow_actor(&env, &escrow, &caller, DELEGATE_PERMISSION_RELEASE)?;
         if escrow.status != EscrowStatus::Locked {
             return Err(Error::FundsNotLocked);
         }
         if escrow.remaining_amount <= 0 {
-            return Err(Error::InsufficientFunds);
+            return Err(Error::InsufficientBalance);
         }
 
         // Enforce transaction limit for contributor
@@ -743,15 +446,6 @@ impl EscrowContract {
     /// Protected by reentrancy guard. Escrow state is updated to
     /// `Refunded` *before* the outbound token transfer (CEI pattern).
     pub fn refund(env: Env, bounty_id: u64) -> Result<(), Error> {
-        let escrow: Escrow = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Escrow(bounty_id))
-            .ok_or(Error::BountyNotFound)?;
-        Self::refund_by(env, escrow.depositor, bounty_id)
-    }
-
-    pub fn refund_by(env: Env, caller: Address, bounty_id: u64) -> Result<(), Error> {
         // GUARD: acquire reentrancy lock
         reentrancy_guard::acquire(&env);
 
@@ -764,7 +458,6 @@ impl EscrowContract {
             .persistent()
             .get(&DataKey::Escrow(bounty_id))
             .unwrap();
-        Self::require_escrow_actor(&env, &escrow, &caller, DELEGATE_PERMISSION_REFUND)?;
         if escrow.status != EscrowStatus::Locked {
             return Err(Error::FundsNotLocked);
         }
@@ -773,7 +466,7 @@ impl EscrowContract {
             return Err(Error::DeadlineNotPassed);
         }
         if escrow.remaining_amount <= 0 {
-            return Err(Error::InsufficientFunds);
+            return Err(Error::InsufficientBalance);
         }
 
         // EFFECTS: update state before external call (CEI)
@@ -800,260 +493,12 @@ impl EscrowContract {
         Ok(())
     }
 
-    pub fn set_delegate(
-        env: Env,
-        caller: Address,
-        bounty_id: u64,
-        delegate: Address,
-        permissions: u32,
-    ) -> Result<(), Error> {
-        Self::validate_delegate_permissions(permissions)?;
-        let mut escrow: Escrow = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Escrow(bounty_id))
-            .ok_or(Error::BountyNotFound)?;
-        Self::require_escrow_owner_or_admin(&env, &escrow, &caller)?;
-
-        if delegate == escrow.depositor {
-            return Err(Error::InvalidDelegateTarget);
-        }
-
-        escrow.delegate = Some(delegate.clone());
-        escrow.delegate_permissions = permissions;
-        env.storage()
-            .persistent()
-            .set(&DataKey::Escrow(bounty_id), &escrow);
-
-        env.events().publish(
-            (ESCROW_DELEGATE_SET, bounty_id),
-            EscrowDelegateSetEvent {
-                bounty_id,
-                delegate,
-                permissions,
-                updated_by: caller,
-                timestamp: env.ledger().timestamp(),
-            },
-        );
-
-        Ok(())
-    }
-
-    pub fn revoke_delegate(env: Env, caller: Address, bounty_id: u64) -> Result<(), Error> {
-        let mut escrow: Escrow = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Escrow(bounty_id))
-            .ok_or(Error::BountyNotFound)?;
-        Self::require_escrow_owner_or_admin(&env, &escrow, &caller)?;
-
-        escrow.delegate = None;
-        escrow.delegate_permissions = 0;
-        env.storage()
-            .persistent()
-            .set(&DataKey::Escrow(bounty_id), &escrow);
-
-        env.events().publish(
-            (ESCROW_DELEGATE_REVOKED, bounty_id),
-            EscrowDelegateRevokedEvent {
-                bounty_id,
-                revoked_by: caller,
-                timestamp: env.ledger().timestamp(),
-            },
-        );
-
-        Ok(())
-    }
-
-    pub fn update_metadata(
-        env: Env,
-        caller: Address,
-        bounty_id: u64,
-        metadata: String,
-    ) -> Result<(), Error> {
-        let mut escrow: Escrow = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Escrow(bounty_id))
-            .ok_or(Error::BountyNotFound)?;
-        Self::require_escrow_actor(&env, &escrow, &caller, DELEGATE_PERMISSION_UPDATE_META)?;
-
-        escrow.metadata = Some(metadata);
-        env.storage()
-            .persistent()
-            .set(&DataKey::Escrow(bounty_id), &escrow);
-
-        env.events().publish(
-            (ESCROW_METADATA_UPDATED, bounty_id),
-            EscrowMetadataUpdatedEvent {
-                bounty_id,
-                updated_by: caller,
-                timestamp: env.ledger().timestamp(),
-            },
-        );
-
-        Ok(())
-    }
-
     /// Read escrow state (for tests).
     pub fn get_escrow(env: Env, bounty_id: u64) -> Result<Escrow, Error> {
         env.storage()
             .persistent()
             .get(&DataKey::Escrow(bounty_id))
             .ok_or(Error::BountyNotFound)
-    }
-
-    pub fn get_label_config(env: Env) -> LabelConfig {
-        Self::get_label_config_internal(&env)
-    }
-
-    pub fn set_label_config(
-        env: Env,
-        restricted: bool,
-        allowed_labels: Vec<String>,
-    ) -> Result<LabelConfig, Error> {
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(Error::NotInitialized)?;
-        admin.require_auth();
-
-        let allowed_labels = Self::sanitize_label_config(&env, allowed_labels)?;
-        let config = LabelConfig {
-            restricted,
-            allowed_labels: allowed_labels.clone(),
-        };
-        env.storage().persistent().set(&DataKey::LabelConfig, &config);
-        env.events().publish(
-            (LABEL_CONFIG_UPDATED,),
-            LabelConfigUpdatedEvent {
-                version: 1,
-                admin,
-                restricted,
-                allowed_labels,
-                timestamp: env.ledger().timestamp(),
-            },
-        );
-        Ok(config)
-    }
-
-    pub fn update_labels(
-        env: Env,
-        actor: Address,
-        bounty_id: u64,
-        labels: Vec<String>,
-    ) -> Result<Escrow, Error> {
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(Error::NotInitialized)?;
-        let mut escrow: Escrow = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Escrow(bounty_id))
-            .ok_or(Error::BountyNotFound)?;
-
-        if actor != admin && actor != escrow.depositor {
-            return Err(Error::Unauthorized);
-        }
-        actor.require_auth();
-
-        let labels = Self::normalize_labels(&env, labels)?;
-        escrow.labels = labels.clone();
-        env.storage()
-            .persistent()
-            .set(&DataKey::Escrow(bounty_id), &escrow);
-        env.events().publish(
-            (ESCROW_LABELS_UPDATED, bounty_id),
-            EscrowLabelsUpdatedEvent {
-                version: 1,
-                bounty_id,
-                actor,
-                labels,
-                timestamp: env.ledger().timestamp(),
-            },
-        );
-        Ok(escrow)
-    }
-
-    pub fn get_escrows_by_label(
-        env: Env,
-        label: String,
-        cursor: Option<u64>,
-        limit: u32,
-    ) -> EscrowLabelPage {
-        let effective_limit = if limit == 0 || limit > MAX_PAGE_SIZE {
-            MAX_PAGE_SIZE
-        } else {
-            limit
-        };
-        let index: Vec<u64> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::EscrowIndex)
-            .unwrap_or_else(|| Vec::new(&env));
-
-        let mut records: Vec<EscrowLabelRecord> = Vec::new(&env);
-        let mut collecting = cursor.is_none();
-        let mut next_cursor = None;
-        let mut has_more = false;
-
-        for i in 0..index.len() {
-            let id = index.get(i).unwrap();
-            if !collecting {
-                if Some(id) == cursor {
-                    collecting = true;
-                }
-                continue;
-            }
-
-            let Some(escrow) = env
-                .storage()
-                .persistent()
-                .get::<_, Escrow>(&DataKey::Escrow(id))
-            else {
-                continue;
-            };
-
-            let mut matches = false;
-            for escrow_label in escrow.labels.iter() {
-                if escrow_label == label {
-                    matches = true;
-                    break;
-                }
-            }
-            if !matches {
-                continue;
-            }
-
-            if records.len() >= effective_limit {
-                has_more = true;
-                break;
-            }
-
-            next_cursor = Some(id);
-            records.push_back(EscrowLabelRecord {
-                bounty_id: id,
-                depositor: escrow.depositor,
-                amount: escrow.amount,
-                remaining_amount: escrow.remaining_amount,
-                status: escrow.status,
-                deadline: escrow.deadline,
-                labels: escrow.labels,
-            });
-        }
-
-        if !has_more {
-            next_cursor = None;
-        }
-
-        EscrowLabelPage {
-            records,
-            next_cursor,
-            has_more,
-        }
     }
 }
 
@@ -1141,4 +586,3 @@ pub mod traits {
 
 mod identity_test;
 mod test;
-mod test_dispute_resolution;
