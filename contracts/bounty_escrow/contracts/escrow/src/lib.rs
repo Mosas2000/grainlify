@@ -3081,7 +3081,7 @@ impl BountyEscrowContract {
         Self::ensure_address_not_frozen(&env, &escrow.depositor)?;
 
         if escrow.status != EscrowStatus::Locked {
-            env.storage().instance().remove(&DataKey::ReentrancyGuard);
+            reentrancy_guard::release(&env);
             return Err(Error::FundsNotLocked);
         }
 
@@ -3108,7 +3108,7 @@ impl BountyEscrowContract {
             .checked_sub(release_fee)
             .unwrap_or(escrow.amount);
         if net_payout <= 0 {
-            env.storage().instance().remove(&DataKey::ReentrancyGuard);
+            reentrancy_guard::release(&env);
             return Err(Error::InvalidAmount);
         }
 
@@ -4566,6 +4566,24 @@ impl BountyEscrowContract {
                     timestamp,
                 },
             );
+            Ok(locked_count)
+        })();
+
+        // Gas budget cap enforcement (test / testutils only).
+        #[cfg(any(test, feature = "testutils"))]
+        if result.is_ok() {
+            let gas_cfg = gas_budget::get_config(&env);
+            if let Err(e) = gas_budget::check(
+                &env,
+                symbol_short!("b_lock"),
+                &gas_cfg.batch_lock,
+                &gas_snapshot,
+                gas_cfg.enforce,
+            ) {
+                reentrancy_guard::release(&env);
+                return Err(e);
+            }
+        }
 
             Ok(locked_count)
         })();
