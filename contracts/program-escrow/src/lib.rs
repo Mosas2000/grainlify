@@ -468,7 +468,8 @@ pub enum DataKey {
     MaintenanceMode,                 // bool flag
     ProgramDependencies(String),     // program_id -> Vec<String>
     DependencyStatus(String),        // program_id -> DependencyStatus
-    Dispute,                         // DisputeRecord (single active dispute per contract)
+    Dispute,  
+    SplitConfig(String),                       // DisputeRecord (single active dispute per contract)
 }
 
 #[contracttype]
@@ -1751,6 +1752,8 @@ impl ProgramEscrowContract {
         }
 
         // Transfer funds from contract to recipient
+        let contract_address = env.current_contract_address();
+        let token_client = token::Client::new(&env, &program_data.token_address);
         token_client.transfer(&contract_address, &recipient, &amount);
 
         // Record success for circuit breaker and threshold monitor
@@ -1860,7 +1863,7 @@ impl ProgramEscrowContract {
 
         let schedule = ProgramReleaseSchedule {
             schedule_id,
-            recipient,
+            recipient: recipient.clone(),
             amount,
             release_timestamp,
             released: false,
